@@ -1,0 +1,528 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Echo Paths</title>
+<style>
+:root{color-scheme:dark;--bg:#04050c;--fg:#dff6ff;--dim:#7f98aa;--acc:#6fdcff;--gold:#ffd36b}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent;user-select:none}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);overflow:hidden;font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+canvas{position:fixed;inset:0;width:100%;height:100%;touch-action:none;cursor:crosshair;display:block}
+#hud{position:fixed;inset:0;pointer-events:none;padding:env(safe-area-inset-top,0px) env(safe-area-inset-right,0px) env(safe-area-inset-bottom,0px) env(safe-area-inset-left,0px)}
+.tl{position:absolute;top:16px;left:20px}.tr{position:absolute;top:18px;right:20px;text-align:right;color:var(--dim);font-size:13px;letter-spacing:.15em}
+#score{font-size:clamp(30px,6vw,46px);font-weight:200;letter-spacing:.06em;text-shadow:0 0 18px rgba(111,220,255,.6)}
+#time{color:var(--dim);font-size:13px;letter-spacing:.2em;margin-top:2px}
+#pu{position:absolute;bottom:calc(28px + env(safe-area-inset-bottom,0px));left:0;right:0;text-align:center;font-size:15px;font-weight:300;letter-spacing:.3em;line-height:1.7}
+#ov{position:fixed;inset:0;display:none;align-items:center;justify-content:center;text-align:center;background:radial-gradient(ellipse at center,rgba(4,5,12,.55),rgba(4,5,12,.9));cursor:pointer;padding:24px}
+#ov.on{display:flex}
+#ov h1{font-weight:200;letter-spacing:.35em;margin:0 0 14px;font-size:clamp(28px,7vw,54px);text-shadow:0 0 28px rgba(111,220,255,.7);padding-left:.35em}
+#ov p{margin:6px 0;color:var(--dim);line-height:1.6;font-size:clamp(13px,2.4vw,15px)}
+#ov .big{font-size:clamp(54px,14vw,96px);font-weight:200;color:var(--fg);text-shadow:0 0 30px rgba(111,220,255,.7);margin:4px 0}
+#ov .tag{color:var(--fg);font-size:clamp(15px,3vw,19px);letter-spacing:.08em;margin-bottom:18px}
+#ov .gold{color:var(--gold)}
+#ov button{margin-top:22px;background:transparent;color:var(--fg);border:1px solid var(--acc);padding:13px 34px;border-radius:40px;font-size:14px;letter-spacing:.3em;cursor:pointer;box-shadow:0 0 18px rgba(111,220,255,.35),inset 0 0 12px rgba(111,220,255,.15)}
+#ov button:hover{background:rgba(111,220,255,.12)}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud">
+  <div class="tl"><div id="score">0</div><div id="time">0:00</div></div>
+  <div class="tr">BEST <span id="best">0</span></div>
+  <div id="pu"></div>
+</div>
+<div id="ov"></div>
+
+<script>
+'use strict';
+/* ===========================================================
+   ECHO PATHS — endless minimalist skill game (vanilla JS + Canvas)
+   Move -> leave a trail -> trail hardens into walls -> survive.
+   Sections: setup, audio, world helpers, update, render, input, UI
+   =========================================================== */
+
+// ---------- Setup ----------
+const $ = id => document.getElementById(id);
+const cv = $('c'), ctx = cv.getContext('2d');
+const CELL = 128;        // spatial hash cell size (world units)
+const HARDEN = 1.2;      // seconds before a trail becomes a wall
+const R = 5;             // player collision radius
+const GHOST_TIME = 2.3;  // Phase duration (seconds)
+const ERASE_RADIUS = 260; // True Eraser blast radius (world units)
+// Power-up table: c = glow colour (rgb), h = particle hue, w = spawn weight
+const POW = {
+  phase:  { c: '175,125,255', h: 265, w: .28 },  // timed: pass through walls, no trail
+  eraser: { c: '255,100,40',  h: 18,  w: .20 },  // instant: wipes nearby walls
+  magnet: { c: '255,214,70',  h: 48,  w: .20 },  // timed: pulls motes in
+  surge:  { c: '255,70,200',  h: 315, w: .16 },  // timed: score x2 / x3
+  slow:   { c: '110,150,255', h: 225, w: .16 }   // timed: slows game speed
+};
+let W, H, DPR, S = 1, vignette;
+
+function resize() {
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  W = innerWidth; H = innerHeight;
+  cv.width = W * DPR; cv.height = H * DPR;
+  S = Math.max(0.6, Math.min(1.3, Math.min(W, H) / 800)); // zoom: keeps view comparable on phones
+  vignette = ctx.createRadialGradient(W / 2, H / 2, Math.min(W, H) * 0.2, W / 2, H / 2, Math.hypot(W, H) * 0.6);
+  vignette.addColorStop(0, 'rgba(14,22,48,0.55)'); vignette.addColorStop(1, 'rgba(0,0,0,0)');
+}
+addEventListener('resize', resize); resize();
+
+let best = 0;
+try { best = +localStorage.getItem('echoPathsBest') || 0; } catch (e) {}
+$('best').textContent = best;
+
+const rnd = (a, b) => a + Math.random() * (b - a);
+const stars = Array.from({ length: 90 }, () => ({ x: Math.random(), y: Math.random(), p: rnd(.05, .35), s: rnd(.4, 1.5), tw: rnd(0, 6) }));
+
+// ---------- Game state ----------
+let state = 'menu';       // menu | play | paused | dead
+let grid, walls, pend, motes, parts, pops, pups, rings;
+let pl, cam, t, clock = 0, score, ghost, act, flashT, pupT, shake, lastCull, spawnT, deathAt = 0, frame = 0;
+let mx = null, my = null; // mouse/touch screen position
+const keys = new Set();
+
+function reset() {
+  grid = new Map(); walls = []; pend = []; motes = []; parts = []; pops = []; pups = []; rings = [];
+  pl = { x: 0, y: 0, vx: 0, vy: 0, lx: null, ly: null };
+  cam = { x: 0, y: 0 };
+  t = 0; score = 0; ghost = 0; act = { magnet: 0, surge: 0, slow: 0, surgeM: 2 }; flashT = 0; shake = 0; lastCull = 0; spawnT = 0; pupT = 2;
+  for (let i = 0; i < 16; i++) spawnMote(true);
+}
+
+// ---------- Audio (tiny procedural) ----------
+let ac = null, muted = false, droneG = null;
+function initAudio() {
+  try {
+    if (!ac) {
+      ac = new (window.AudioContext || window.webkitAudioContext)();
+      droneG = ac.createGain(); droneG.gain.value = 0.012; droneG.connect(ac.destination);
+      [55, 82.4, 110.3].forEach(f => { const o = ac.createOscillator(); o.frequency.value = f; o.connect(droneG); o.start(); });
+    }
+    if (ac.state === 'suspended') ac.resume();
+  } catch (e) { ac = null; }
+}
+function sfx(f, d = .15, type = 'sine', v = .05, slide = 0) {
+  if (!ac || muted) return;
+  const n = ac.currentTime, o = ac.createOscillator(), g = ac.createGain();
+  o.type = type; o.frequency.setValueAtTime(f, n);
+  if (slide) o.frequency.exponentialRampToValueAtTime(Math.max(30, f * slide), n + d);
+  g.gain.setValueAtTime(v, n); g.gain.exponentialRampToValueAtTime(.0001, n + d);
+  o.connect(g); g.connect(ac.destination); o.start(); o.stop(n + d);
+}
+
+// ---------- Walls: spatial hash grid ----------
+function cellAt(x, y, create) {
+  const cx = Math.floor(x / CELL), cy = Math.floor(y / CELL), k = cx * 65537 + cy;
+  let c = grid.get(k);
+  if (!c && create) { c = { x: cx, y: cy, a: [] }; grid.set(k, c); }
+  return c;
+}
+function addWall(w) {
+  const a = cellAt(w.x1, w.y1, true), b = cellAt(w.x2, w.y2, true);
+  a.a.push(w); if (b !== a) b.a.push(w);
+  walls.push(w);
+}
+function segDist2(px, py, w) {
+  const dx = w.x2 - w.x1, dy = w.y2 - w.y1, l = dx * dx + dy * dy;
+  let u = l ? ((px - w.x1) * dx + (py - w.y1) * dy) / l : 0;
+  u = u < 0 ? 0 : u > 1 ? 1 : u;
+  const x = w.x1 + u * dx - px, y = w.y1 + u * dy - py;
+  return x * x + y * y;
+}
+// Visit walls in the 3x3 cells around a point
+function eachNear(x, y, fn) {
+  const cx = Math.floor(x / CELL), cy = Math.floor(y / CELL);
+  for (let i = -1; i <= 1; i++) for (let j = -1; j <= 1; j++) {
+    const c = grid.get((cx + i) * 65537 + cy + j);
+    if (c) for (const w of c.a) if (!w.dead && fn(w)) return true;
+  }
+  return false;
+}
+const hitWall = (x, y) => eachNear(x, y, w => t >= w.arm && segDist2(x, y, w) < (R + 1) * (R + 1));
+
+// Drop far-away walls/cells so the world stays "endless" without growing memory
+function cull() {
+  walls = walls.filter(w => !w.dead && Math.abs(w.x1 - pl.x) < 4000 && Math.abs(w.y1 - pl.y) < 4000);
+  for (const [k, c] of grid) {
+    if (Math.abs(c.x * CELL - pl.x) > 4200 || Math.abs(c.y * CELL - pl.y) > 4200) grid.delete(k);
+    else c.a = c.a.filter(w => !w.dead);
+  }
+}
+
+// ---------- Motes, particles ----------
+function spawnMote(init) {
+  const r0 = Math.hypot(W, H) / 2 / S;
+  for (let tries = 0; tries < 6; tries++) {
+    const a = rnd(0, 6.283), d = r0 * (init ? rnd(.15, .8) : rnd(.7, 1.05));
+    const x = pl.x + Math.cos(a) * d, y = pl.y + Math.sin(a) * d;
+    if (eachNear(x, y, w => segDist2(x, y, w) < 196)) continue; // not inside walls
+    motes.push({ x, y, ph: rnd(0, 6.28) });
+    return;
+  }
+}
+// Is (x,y) open enough to reach? Rejects spots near walls, then casts 8 rays;
+// at least 5 must travel ~150 units without touching a wall.
+function isOpen(x, y) {
+  if (eachNear(x, y, w => segDist2(x, y, w) < 900)) return false;
+  let clear = 0;
+  for (let i = 0; i < 8; i++) {
+    const cx = Math.cos(i * .7854), cy = Math.sin(i * .7854); let ok = true;
+    for (let d = 24; d <= 150; d += 18) {
+      const px = x + cx * d, py = y + cy * d;
+      if (eachNear(px, py, w => segDist2(px, py, w) < 100)) { ok = false; break; }
+    }
+    if (ok) clear++;
+  }
+  return clear >= 5;
+}
+
+// Spawn a power-up in an open spot (tries several candidate points, else cancels)
+function spawnPup() {
+  const r0 = Math.hypot(W, H) / 2 / S;
+  let near = Infinity;
+  for (const p of pups) near = Math.min(near, Math.hypot(p.x - pl.x, p.y - pl.y));
+  let k = 'slow';
+  if (near > r0 * 1.3 && Math.random() < .6) k = Math.random() < .5 ? 'eraser' : 'magnet'; // far from any power-up: favour strong ones
+  else { let r = Math.random(); for (const n in POW) if ((r -= POW[n].w) < 0) { k = n; break; } }
+  for (let tries = 0; tries < 14; tries++) {
+    const a = rnd(0, 6.283), d = r0 * rnd(.6, 1.5);
+    const x = pl.x + Math.cos(a) * d, y = pl.y + Math.sin(a) * d;
+    if (isOpen(x, y)) { pups.push({ x, y, k, ph: rnd(0, 6.28) }); return true; }
+  }
+  return false;
+}
+
+function burst(x, y, n, hue, spd = 160, life = .7) {
+  for (let i = 0; i < n; i++) {
+    const a = rnd(0, 6.283), v = rnd(.2, 1) * spd;
+    parts.push({ x, y, vx: Math.cos(a) * v, vy: Math.sin(a) * v, l: rnd(.4, 1) * life, m: life, h: hue + rnd(-15, 15), s: rnd(1, 2.6) });
+  }
+}
+
+function collect(m) {
+  // Risk multiplier: more wall segments near the mote = higher reward
+  let near = 0; eachNear(m.x, m.y, w => { if (segDist2(m.x, m.y, w) < 4900) near++; return false; });
+  const mult = 1 + Math.min(4, Math.floor(near / 8));
+  const surge = act.surge > 0;
+  const pts = 10 * mult * (surge ? act.surgeM : 1);
+  score += pts;
+  pops.push({ x: m.x, y: m.y, txt: '+' + pts + (mult > 1 ? ' ×' + mult : ''), l: 1, c: surge ? '255,120,220' : '170,240,255' });
+  burst(m.x, m.y, 16, surge ? 315 : 185, 150);
+  sfx(480 + mult * 90, .18, 'sine', .06, 1.5);
+}
+
+// ---------- Update ----------
+function update(dt) {
+  const rdt = dt;                       // real time, used for power-up timers
+  if (act.slow > 0) dt *= .6;           // Time Slow
+  for (const k in act) if (k !== 'surgeM' && act[k] > 0) act[k] -= rdt;
+  t += dt;
+  const speed = Math.min(250 + t * 1.4, 430); // gradual base speed ramp
+
+  // Desired direction: keys override mouse/touch
+  let kx = (keys.has('d') || keys.has('arrowright') ? 1 : 0) - (keys.has('a') || keys.has('arrowleft') ? 1 : 0);
+  let ky = (keys.has('s') || keys.has('arrowdown') ? 1 : 0) - (keys.has('w') || keys.has('arrowup') ? 1 : 0);
+  let dx = 0, dy = 0, mag = 0;
+  if (kx || ky) { const l = Math.hypot(kx, ky); dx = kx / l; dy = ky / l; mag = 1; }
+  else if (mx !== null) {
+    const tx = cam.x + (mx - W / 2) / S, ty = cam.y + (my - H / 2) / S;
+    const ddx = tx - pl.x, ddy = ty - pl.y, d = Math.hypot(ddx, ddy);
+    if (d > 4) { dx = ddx / d; dy = ddy / d; mag = Math.min(1, (d - 4) / 70); } // ease out near cursor
+  }
+  const k = 1 - Math.exp(-dt * 9);
+  pl.vx += (dx * speed * mag - pl.vx) * k;
+  pl.vy += (dy * speed * mag - pl.vy) * k;
+
+  // Ghost timer (stays active while overlapping a wall so you never get trapped)
+  if (ghost > 0) { ghost -= rdt; if (ghost <= 0 && hitWall(pl.x, pl.y)) ghost = .05; }
+
+  // Sub-stepped movement so fast orbs never tunnel through thin walls
+  const mv = Math.hypot(pl.vx, pl.vy) * dt, steps = Math.max(1, Math.ceil(mv / 4));
+  for (let i = 0; i < steps; i++) {
+    pl.x += pl.vx * dt / steps; pl.y += pl.vy * dt / steps;
+    layTrail();
+    if (ghost <= 0 && hitWall(pl.x, pl.y)) return die();
+  }
+
+  // Harden old trail into walls
+  while (pend.length && t - pend[0].t0 >= HARDEN) {
+    const w = pend.shift(); w.arm = t + .3; // short arming delay avoids unfair self-hits
+    addWall(w);
+    if (Math.random() < .25) burst(w.x2, w.y2, 1, 195, 30, .5);
+  }
+
+  // Power-ups: spawn timer, pickup, despawn when far away
+  pupT -= dt;
+  if (pups.length < 3 && pupT <= 0) pupT = spawnPup() ? rnd(4, 7) : 1;
+  for (let i = pups.length - 1; i >= 0; i--) {
+    const p = pups[i], d = Math.hypot(p.x - pl.x, p.y - pl.y);
+    if (d < R + 11) { collectPup(p); pups.splice(i, 1); }
+    else if (d > Math.hypot(W, H) / 2 / S * 3.2) pups.splice(i, 1);
+  }
+
+  // Motes
+  spawnT -= dt;
+  if (motes.length < 22 && spawnT <= 0) { spawnMote(false); spawnT = .25; }
+  const r0 = Math.hypot(W, H) / 2 / S;
+  for (let i = motes.length - 1; i >= 0; i--) {
+    const m = motes[i], ddx = pl.x - m.x, ddy = pl.y - m.y, d = Math.hypot(ddx, ddy);
+    const pr = act.magnet > 0 ? 340 : 95, pull = act.magnet > 0 ? 560 : 140; // Magnet: wide, strong pull
+    if (d < pr) { const p = (1 - d / pr) * pull * dt / (d || 1); m.x += ddx * p; m.y += ddy * p; }
+    if (d < R + 8) { collect(m); motes.splice(i, 1); }
+    else if (d > r0 * 1.8) motes.splice(i, 1);
+  }
+
+  if (t - lastCull > 4) { lastCull = t; cull(); }
+}
+
+// Add a trail segment every ~5 world units (no trail while phasing)
+function layTrail() {
+  if (ghost > 0) { pl.lx = null; return; }
+  if (pl.lx === null) { pl.lx = pl.x; pl.ly = pl.y; return; }
+  if (Math.hypot(pl.x - pl.lx, pl.y - pl.ly) >= 5) {
+    pend.push({ x1: pl.lx, y1: pl.ly, x2: pl.x, y2: pl.y, t0: t, arm: 0 });
+    pl.lx = pl.x; pl.ly = pl.y;
+  }
+}
+
+function collectPup(p) {
+  burst(p.x, p.y, 40, POW[p.k].h, 240, .9);
+  sfx(380, .4, 'triangle', .07, 2.5);
+  if (p.k === 'phase') { ghost = GHOST_TIME; pend.length = 0; pl.lx = null; } // also clears the active trail
+  else if (p.k === 'magnet') act.magnet = 4.5;
+  else if (p.k === 'surge') { act.surge = 7; act.surgeM = Math.random() < .35 ? 3 : 2; }
+  else if (p.k === 'slow') act.slow = 4;
+  else if (p.k === 'eraser') trueErase();
+}
+
+// True Eraser: instantly deletes every solid wall within ERASE_RADIUS of the player
+function trueErase() {
+  let n = 0;
+  for (const w of walls) {
+    if (w.dead) continue;
+    const ax = (w.x1 + w.x2) / 2, ay = (w.y1 + w.y2) / 2;
+    if (Math.hypot(ax - pl.x, ay - pl.y) < ERASE_RADIUS) { w.dead = true; if (++n % 2 === 0) burst(ax, ay, 2, 18, 140, .8); }
+  }
+  rings.push({ x: pl.x, y: pl.y, r: 12, l: .45, m: .45 }, { x: pl.x, y: pl.y, r: 4, l: .3, m: .3 });
+  burst(pl.x, pl.y, 60, 20, 420, 1);
+  shake = Math.max(shake, 10 + Math.min(n, 60) * .1); flashT = 1;
+  sfx(90, .6, 'sawtooth', .1, .4);
+}
+
+function die() {
+  state = 'dead'; deathAt = performance.now(); shake = 18;
+  burst(pl.x, pl.y, 110, 190, 380, 1.2);
+  sfx(120, .7, 'sawtooth', .09, .3);
+  const nb = score > best;
+  if (nb) { best = score; try { localStorage.setItem('echoPathsBest', best); } catch (e) {} $('best').textContent = best; }
+  show('dead', nb);
+}
+
+function fx(dt) { // particles, popups, shake: run in all non-paused states
+  clock += dt; shake *= Math.exp(-dt * 6); flashT -= dt;
+  for (let i = rings.length - 1; i >= 0; i--) { const r = rings[i]; r.l -= dt; r.r += ERASE_RADIUS / .45 * dt; if (r.l <= 0) rings.splice(i, 1); }
+  for (let i = parts.length - 1; i >= 0; i--) {
+    const p = parts[i]; p.l -= dt;
+    if (p.l <= 0) { parts.splice(i, 1); continue; }
+    p.x += p.vx * dt; p.y += p.vy * dt; const f = Math.exp(-dt * 2.5); p.vx *= f; p.vy *= f;
+  }
+  for (let i = pops.length - 1; i >= 0; i--) { const p = pops[i]; p.l -= dt; p.y -= 24 * dt; if (p.l <= 0) pops.splice(i, 1); }
+}
+
+// ---------- Render ----------
+function draw() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.fillStyle = '#04050c'; ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = vignette; ctx.fillRect(0, 0, W, H);
+
+  // Parallax stars (screen space)
+  for (const s of stars) {
+    const px = ((s.x * W - cam.x * s.p * S) % W + W) % W, py = ((s.y * H - cam.y * s.p * S) % H + H) % H;
+    ctx.globalAlpha = .25 + .2 * Math.sin(clock * 1.5 + s.tw);
+    ctx.fillStyle = '#9fc4ff'; ctx.fillRect(px, py, s.s, s.s);
+  }
+  ctx.globalAlpha = 1;
+
+  const sx = (Math.random() - .5) * shake * 2, sy = (Math.random() - .5) * shake * 2;
+  ctx.setTransform(DPR * S, 0, 0, DPR * S, DPR * (W / 2 - cam.x * S + sx), DPR * (H / 2 - cam.y * S + sy));
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.lineCap = 'round';
+
+  // Solid walls: gather visible segments into one path, stroke twice (glow + core)
+  const hw = W / 2 / S + 40, hh = H / 2 / S + 40;
+  ctx.beginPath();
+  for (let cx = Math.floor((cam.x - hw) / CELL); cx <= Math.floor((cam.x + hw) / CELL); cx++)
+    for (let cy = Math.floor((cam.y - hh) / CELL); cy <= Math.floor((cam.y + hh) / CELL); cy++) {
+      const c = grid.get(cx * 65537 + cy);
+      if (c) for (const w of c.a) if (!w.dead && w.f !== frame) { w.f = frame; ctx.moveTo(w.x1, w.y1); ctx.lineTo(w.x2, w.y2); }
+    }
+  ctx.strokeStyle = 'rgba(50,140,255,.2)'; ctx.lineWidth = 7; ctx.stroke();
+  ctx.strokeStyle = 'rgba(130,225,255,.9)'; ctx.lineWidth = 1.5; ctx.stroke();
+
+  // Pending trail: bright -> dim as it approaches hardening
+  for (const s of pend) {
+    const a = Math.min(1, (t - s.t0) / HARDEN);
+    ctx.beginPath(); ctx.moveTo(s.x1, s.y1); ctx.lineTo(s.x2, s.y2);
+    ctx.strokeStyle = `hsla(${175 + a * 45},100%,${88 - a * 38}%,${.28 * (1 - a * .5)})`; ctx.lineWidth = 9 - a * 4; ctx.stroke();
+    ctx.strokeStyle = `hsla(${175 + a * 45},100%,${90 - a * 40}%,${1 - a * .6})`; ctx.lineWidth = 3.2 - a * 1.6; ctx.stroke();
+  }
+
+  // Motes
+  for (const m of motes) {
+    const p = 1 + .25 * Math.sin(clock * 3 + m.ph), r = 3.2, c = '120,240,255';
+    ctx.fillStyle = `rgba(${c},.07)`; ctx.beginPath(); ctx.arc(m.x, m.y, r * 5 * p, 0, 6.283); ctx.fill();
+    ctx.fillStyle = `rgba(${c},.2)`; ctx.beginPath(); ctx.arc(m.x, m.y, r * 2.4 * p, 0, 6.283); ctx.fill();
+    ctx.fillStyle = `rgba(255,255,255,.95)`; ctx.beginPath(); ctx.arc(m.x, m.y, r * .8, 0, 6.283); ctx.fill();
+  }
+  drawPups();
+
+  // Particles
+  for (const p of parts) {
+    ctx.fillStyle = `hsla(${p.h},100%,70%,${Math.max(0, p.l / p.m)})`;
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.s * (.4 + p.l / p.m), 0, 6.283); ctx.fill();
+  }
+
+  // Player orb
+  if (state !== 'dead') {
+    const pulse = 1 + .12 * Math.sin(clock * 5), gh = ghost > 0;
+    const g = ctx.createRadialGradient(pl.x, pl.y, 0, pl.x, pl.y, 30 * pulse);
+    g.addColorStop(0, gh ? 'rgba(225,200,255,.9)' : 'rgba(255,255,255,.95)');
+    g.addColorStop(.25, gh ? 'rgba(175,125,255,.45)' : 'rgba(110,220,255,.45)');
+    g.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = g; ctx.beginPath(); ctx.arc(pl.x, pl.y, 30 * pulse, 0, 6.283); ctx.fill();
+    ctx.fillStyle = '#fff'; ctx.globalAlpha = gh ? .55 + .3 * Math.sin(clock * 30) : 1;
+    ctx.beginPath(); ctx.arc(pl.x, pl.y, (R + 1) * pulse, 0, 6.283); ctx.fill(); ctx.globalAlpha = 1;
+    if (gh) { ctx.strokeStyle = 'rgba(190,150,255,.85)'; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.arc(pl.x, pl.y, 14, -1.57, -1.57 + 6.283 * Math.max(0, ghost / GHOST_TIME)); ctx.stroke(); }
+  }
+
+  // Auras for active timed power-ups
+  if (state !== 'dead') for (const k of ['magnet', 'surge', 'slow']) if (act[k] > 0) {
+    ctx.strokeStyle = `rgba(${POW[k].c},${Math.min(.5, act[k])})`; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.arc(pl.x, pl.y, k === 'magnet' ? 24 + 4 * Math.sin(clock * 6) : k === 'surge' ? 18 : 30, 0, 6.283); ctx.stroke();
+  }
+
+  // Score popups
+  ctx.globalCompositeOperation = 'source-over'; ctx.font = '600 13px system-ui,sans-serif'; ctx.textAlign = 'center';
+  for (const p of pops) { ctx.fillStyle = `rgba(${p.c},${Math.min(1, p.l * 1.5)})`; ctx.fillText(p.txt, p.x, p.y - 12); }
+  drawArrows();
+}
+
+// Power-up orbs (each with its own glow colour) and True Eraser shockwave rings
+function drawPups() {
+  for (const p of pups) {
+    const c = POW[p.k].c, pu = 1 + .2 * Math.sin(clock * 3.5 + p.ph);
+    ctx.fillStyle = `rgba(${c},.07)`; ctx.beginPath(); ctx.arc(p.x, p.y, 34 * pu, 0, 6.283); ctx.fill();
+    ctx.fillStyle = `rgba(${c},.2)`; ctx.beginPath(); ctx.arc(p.x, p.y, 17 * pu, 0, 6.283); ctx.fill();
+    ctx.fillStyle = `rgba(${c},1)`; ctx.beginPath(); ctx.arc(p.x, p.y, 6, 0, 6.283); ctx.fill();
+    ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(p.x, p.y, 2.6, 0, 6.283); ctx.fill();
+    ctx.strokeStyle = `rgba(${c},.85)`; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.arc(p.x, p.y, 12, clock * 1.5, clock * 1.5 + 4.4); ctx.stroke();
+  }
+  for (const r of rings) {
+    ctx.strokeStyle = `rgba(255,120,50,${Math.max(0, r.l / r.m)})`; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.arc(r.x, r.y, r.r, 0, 6.283); ctx.stroke();
+  }
+}
+
+// Edge arrows toward the 2 nearest power-ups, only while they are off-screen
+function drawArrows() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0); ctx.globalCompositeOperation = 'source-over';
+  ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  const m = 36;
+  const list = pups.map(p => ({ p, d: Math.hypot(p.x - pl.x, p.y - pl.y) })).sort((a, b) => a.d - b.d).slice(0, 2);
+  for (const { p, d } of list) {
+    const dx = (p.x - cam.x) * S, dy = (p.y - cam.y) * S;
+    if (Math.abs(dx) < W / 2 && Math.abs(dy) < H / 2) continue; // on screen: no arrow
+    const k = Math.min((W / 2 - m) / (Math.abs(dx) || 1e-6), (H / 2 - m) / (Math.abs(dy) || 1e-6));
+    ctx.save(); ctx.translate(W / 2 + dx * k, H / 2 + dy * k); ctx.rotate(Math.atan2(dy, dx));
+    ctx.strokeStyle = `rgba(${POW[p.k].c},${Math.max(.25, Math.min(.65, 1.4 - d / 2500))})`; ctx.lineWidth = 2.5;
+    ctx.beginPath(); ctx.moveTo(-6, -9); ctx.lineTo(4, 0); ctx.lineTo(-6, 9); ctx.stroke();
+    ctx.restore();
+  }
+}
+
+// ---------- HUD ----------
+let hs = -1, ht = '', hp = '';
+function hud() {
+  const sc = Math.floor(score); if (sc !== hs) { hs = sc; $('score').textContent = sc; }
+  const m = Math.floor(t / 60), s = Math.floor(t % 60), tt = m + ':' + (s < 10 ? '0' : '') + s;
+  if (tt !== ht) { ht = tt; $('time').textContent = tt; }
+  // Power-up readout: only shown while something is active (or briefly for ERASED)
+  let h = '';
+  if (state === 'play') {
+    const line = (k, txt) => `<div style="color:rgb(${POW[k].c});text-shadow:0 0 12px rgba(${POW[k].c},.7)">${txt}</div>`;
+    if (ghost > 0) h += line('phase', 'PHASE ' + ghost.toFixed(1) + 's');
+    if (act.magnet > 0) h += line('magnet', 'MAGNET ' + act.magnet.toFixed(1) + 's');
+    if (act.surge > 0) h += line('surge', 'SURGE ×' + act.surgeM + ' ' + act.surge.toFixed(1) + 's');
+    if (act.slow > 0) h += line('slow', 'SLOW ' + act.slow.toFixed(1) + 's');
+    if (flashT > 0) h = `<div style="color:rgb(${POW.eraser.c});opacity:${Math.min(1, flashT * 2).toFixed(2)};text-shadow:0 0 14px rgba(${POW.eraser.c},.8)">ERASED</div>` + h;
+  }
+  if (h !== hp) { hp = h; $('pu').innerHTML = h; }
+}
+
+// ---------- Main loop ----------
+let last = 0;
+function loop(ts) {
+  requestAnimationFrame(loop);
+  const dt = Math.min((ts - last) / 1000 || 0, 1 / 30); last = ts; frame++;
+  if (state === 'play') update(dt);
+  if (state !== 'paused') fx(dt);
+  // Camera: smooth follow with a little look-ahead
+  const k = 1 - Math.exp(-dt * 5);
+  cam.x += (pl.x + pl.vx * .25 - cam.x) * k; cam.y += (pl.y + pl.vy * .25 - cam.y) * k;
+  draw(); hud();
+}
+
+// ---------- UI / state transitions ----------
+const ov = $('ov');
+function show(kind, nb) {
+  let h = '';
+  if (kind === 'menu') h = `<div><h1>ECHO PATHS</h1><div class="tag">Move to leave trails. Trails become walls. Survive.</div>
+    <p>Steer with mouse, touch-drag, or WASD / arrows.</p>
+    <p>Collect motes — riskier, wall-dense ones score more.</p>
+    <p>Power-ups: <span style="color:#af7dff">Phase</span> · <span style="color:#ff6428">Eraser</span> · <span style="color:#ffd646">Magnet</span> · <span style="color:#ff46c8">Surge</span> · <span style="color:#6e96ff">Slow</span></p>
+    <p>Follow the edge arrows to find them.</p>
+    <button>BEGIN</button></div>`;
+  else if (kind === 'paused') h = `<div><h1>PAUSED</h1><p>Click, tap or press any key to resume</p><button>RESUME</button></div>`;
+  else h = `<div><p>YOU CRASHED INTO YOUR ECHO</p><div class="big">${Math.floor(score)}</div>
+    <p class="${nb ? 'gold' : ''}">${nb ? 'NEW BEST' : 'BEST ' + best} · survived ${$('time').textContent}</p>
+    <button>PLAY AGAIN</button><p style="font-size:12px;margin-top:14px">Enter / R</p></div>`;
+  ov.innerHTML = h; ov.className = 'on';
+}
+function hide() { ov.className = ''; }
+function start() { initAudio(); reset(); state = 'play'; hide(); }
+function pause() { if (state === 'play') { state = 'paused'; show('paused'); if (ac) ac.suspend(); } }
+function resume() { state = 'play'; hide(); if (ac) ac.resume(); }
+function action() { // overlay click / Enter / Space
+  if (state === 'menu') start();
+  else if (state === 'paused') resume();
+  else if (state === 'dead' && performance.now() - deathAt > 300) start();
+}
+ov.addEventListener('click', action);
+
+// ---------- Input ----------
+cv.addEventListener('pointermove', e => { mx = e.clientX; my = e.clientY; });
+cv.addEventListener('pointerdown', e => {
+  mx = e.clientX; my = e.clientY;
+});
+cv.addEventListener('contextmenu', e => e.preventDefault());
+addEventListener('keydown', e => {
+  const k = e.key.toLowerCase();
+  if (['arrowup', 'arrowdown', 'arrowleft', 'arrowright', ' '].includes(k)) e.preventDefault();
+  if (k === 'm') { muted = !muted; if (droneG) droneG.gain.value = muted ? 0 : .012; return; }
+  if (state !== 'play') { if (k === 'enter' || k === ' ' || k === 'r' || state === 'paused') action(); return; }
+  if (k === 'r') start();
+  else if (k === 'p' || k === 'escape') pause();
+  else keys.add(k);
+});
+addEventListener('keyup', e => { keys.delete(e.key.toLowerCase()); if (!keys.size) mx = null; });
+addEventListener('blur', () => { keys.clear(); pause(); });
+document.addEventListener('visibilitychange', () => { if (document.hidden) pause(); });
+
+reset(); show('menu'); requestAnimationFrame(loop);
+</script>
+</body>
+</html>
